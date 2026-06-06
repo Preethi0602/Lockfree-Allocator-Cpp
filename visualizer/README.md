@@ -1,73 +1,97 @@
-# React + TypeScript + Vite
+# Lock-Free Memory Allocator (C++)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+I built this because I wanted to understand what actually makes memory allocation slow in multithreaded programs and how you fix it without mutexes.
 
-Currently, two official plugins are available:
+The answer is Compare-And-Swap (CAS). One atomic CPU instruction that lets multiple threads compete for memory without ever blocking each other.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+🔗 **Live Demo: [lockfree-allocator-cpp.vercel.app](https://lockfree-allocator-cpp.vercel.app/)**
 
-## React Compiler
+![Lock-Free Allocator Visualizer](docs/screenshot.png)
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+---
 
-## Expanding the ESLint configuration
+## What it does
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+Implements a full slab memory allocator from scratch in C++ using lock-free data structures:
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+- Divides memory into 8 size classes (8 to 1024 bytes) no searching for best fit, O(1) always
+- Each size class has a global free list protected by CAS, not a mutex
+- Each thread has a local cache of 16 blocks per size class most allocations never touch an atomic at all
+- Falls back to allocating new 256KB slabs when free lists run empty
+- Benchmarks 1.52x faster than malloc on interleaved alloc/free workloads
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+The visualizer shows thread-local caches filling and draining in real time, and logs every CAS operation and cache hit/miss.
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+---
+
+## Why lock-free?
+
+The standard allocator (`malloc`) uses a global mutex. In a multithreaded program doing thousands of allocations per second, threads spend more time waiting for the lock than actually allocating. The more cores you add, the worse it gets classic lock contention.
+
+Lock-free fixes this with Compare-And-Swap:
+
+```
+do {
+    old = freeList.head          // read current head
+    newBlock->next = old         // point new block at old head
+} while (!CAS(&freeList.head, old, newBlock))  // swap only if nothing changed
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+If two threads try simultaneously, one wins the CAS and the other just retries. No blocking, no sleeping, no kernel involvement. The loser retries immediately and usually succeeds on the next attempt.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+---
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+## The thread-local cache trick
+
+Even CAS has overhead memory barriers, cache coherency traffic across CPU cores. So we add one more layer: each thread gets a private cache of 16 blocks per size class.
+
+Most allocations just pop from the local cache zero atomics, zero contention. Only when the cache runs empty do we go to the global free list and pay the CAS cost. In practice this means 96%+ of allocations are completely lock-free AND atomic-free.
+
+---
+
+## Benchmark results
+
+Tested with 100,000 interleaved alloc/dealloc operations on 32-byte blocks:
+
+    Our allocator: 3384 us
+    malloc:        5158 us
+    Speedup:       1.52x
+
+    Cache miss rate: 3.9%  (96.1% of allocs served from thread cache)
+
+---
+
+## Building and running
+
+Requires g++ with C++17 and runs on macOS or Linux.
+
+    make        # compile
+    make run    # run all demos
+    make clean  # remove build artifacts
+
+The demo runs four scenarios: basic allocation, multithreaded correctness (4 threads, 1000 allocs each), benchmark vs malloc, and size class rounding verification.
+
+---
+
+## Project structure
+
+    include/       free list, slab, allocator headers
+    src/           lock-free implementations
+    tests/         correctness and benchmark demos
+    benchmarks/    extended benchmark suite
+    visualizer/    React + TypeScript interactive UI
+    docs/          notes and screenshots
+
+---
+
+## What I learned
+
+The hardest part wasn't the CAS logic it was understanding memory ordering. `memory_order_release` on writes and `memory_order_acquire` on reads establish a happens-before guarantee across threads. Without them, the CPU or compiler can reorder instructions and a thread might read stale data even after a successful CAS.
+
+The other insight was around the ABA problem a subtle bug where a pointer changes from A to B and back to A, making CAS incorrectly succeed. In production allocators like jemalloc this is handled with tagged pointers or hazard pointers. I kept the implementation simple here, but it's worth knowing the problem exists.
+
+---
+
+## Tech
+
+C++17, std::atomic, Compare-And-Swap, slab allocator design, React, TypeScript, Vite, Tailwind, Vercel
